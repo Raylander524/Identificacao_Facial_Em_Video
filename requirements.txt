@@ -1,0 +1,9 @@
+cvzone
+onnxruntime-gpu
+ultralytics
+opencv-python
+numpy
+insightface
+scikit-learn
+flask
+Werkzeug

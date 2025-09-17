@@ -1,0 +1,119 @@
+<!doctype html>
+<html>
+  <head>
+    <title>Verificação pela Webcam</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css">
+    <style>
+      body { background: #f8f9fa; }
+      .container { max-width: 900px; margin-top: 40px; }
+      .video-box { border-radius: 8px; border: 2px solid #dee2e6; }
+      .card-pessoa { min-width: 300px; max-width: 100%; margin: 24px auto; }
+      .card-header { font-size: 1.2rem; }
+      .img-fluid { max-height: 180px; }
+      .cards-row { display: block; }
+      .card-col {
+        padding-left: 24px;
+        padding-right: 24px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container bg-white shadow rounded p-4">
+      <div class="d-flex justify-content-between align-items-center mb-3">
+        <h2 class="text-primary">
+          <i class="bi bi-camera-video icon-btn me-2"></i>
+          Verificação pela Webcam
+        </h2>
+        <a href="{{ url_for('index') }}" class="btn btn-outline-primary">
+          <i class="bi bi-arrow-left"></i> Voltar
+        </a>
+      </div>
+      <div class="row mb-4">
+        <div class="col-12 text-center">
+          <video id="video" width="480" height="360" autoplay class="video-box"></video>
+          <canvas id="canvas" width="480" height="360" style="display:none;"></canvas>
+        </div>
+      </div>
+      <div id="resultado" class="mb-3 text-center"></div>
+      <div id="foto-reconhecida"></div>
+    </div>
+    <script>
+      let streaming = false;
+      let webcamStream = null;
+
+      function iniciarWebcam() {
+        const video = document.getElementById('video');
+        navigator.mediaDevices.getUserMedia({ video: true })
+          .then(stream => {
+            video.srcObject = stream;
+            webcamStream = stream;
+            streaming = true;
+            capturarEEnviar();
+          });
+      }
+
+      function capturarEEnviar() {
+        if (!streaming) return;
+        const video = document.getElementById('video');
+        const canvas = document.getElementById('canvas');
+        const resultado = document.getElementById('resultado');
+        const fotoReconhecida = document.getElementById('foto-reconhecida');
+        canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+        canvas.toBlob(function(blob) {
+          const formData = new FormData();
+          formData.append('frame', blob, 'frame.jpg');
+          fetch('/processar_frame', {
+            method: 'POST',
+            body: formData
+          })
+          .then(response => response.json())
+          .then(data => {
+            resultado.innerHTML = data.mensagem;
+            if (data.encontrado && data.pessoas && data.pessoas.length > 0) {
+              let html = '<div class="row justify-content-center gx-5 gy-5">';
+              data.pessoas.forEach(pessoa => {
+                html += `
+                  <div class="col-12 col-md-6 col-lg-4 d-flex card-col">
+                    <div class="card card-pessoa shadow-lg border-0 flex-fill">
+                      <div class="card-header bg-primary text-white text-center">
+                        <i class="bi bi-person-circle"></i> ${pessoa.nome}
+                      </div>
+                      <div class="card-body">
+                        <div class="row align-items-center">
+                          <div class="col-6 text-center mb-2 mb-md-0">
+                            <img src="data:image/jpeg;base64,${pessoa.foto}" class="img-fluid rounded border">
+                            <div class="mt-2 text-secondary fw-semibold">Recorte do Vídeo</div>
+                          </div>
+                          <div class="col-6 text-center">
+                            <img src="data:image/jpeg;base64,${pessoa.foto_referencia}" class="img-fluid rounded border">
+                            <div class="mt-2 text-secondary fw-semibold">Imagem Arquivada</div>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                `;
+              });
+              html += '</div>';
+              fotoReconhecida.innerHTML = html;
+            } else {
+              fotoReconhecida.innerHTML = "";
+            }
+          });
+        }, 'image/jpeg');
+        setTimeout(capturarEEnviar, 500);
+      }
+
+      window.onload = iniciarWebcam;
+
+      window.onbeforeunload = function() {
+        streaming = false;
+        if (webcamStream) {
+          webcamStream.getTracks().forEach(track => track.stop());
+          webcamStream = null;
+        }
+      };
+    </script>
+  </body>
+</html>
