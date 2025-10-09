@@ -1,13 +1,18 @@
-from flask import Flask, request, render_template, redirect, url_for, send_from_directory, jsonify
+import numpy as np
+from flask import Flask, request, render_template, url_for, jsonify,send_from_directory
 import os
 import cv2
 from ultralytics import YOLO
 import insightface
-from sklearn.metrics.pairwise import cosine_similarity
 from werkzeug.utils import secure_filename
 import threading
 import queue
 import base64
+import faiss
+import pickle
+import uuid
+import shutil
+import onnxruntime as ort
 
 # === Configuração Flask ===
 app = Flask(__name__)
@@ -15,64 +20,67 @@ UPLOAD_FOLDER = "uploads"
 RESULT_FOLDER = "static/resultados"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(RESULT_FOLDER, exist_ok=True)
+PASTA_INDICE = "index"
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+
 
 # === Carregar modelos ===
 yolo = YOLO("yolo11n.pt")
-model = insightface.app.FaceAnalysis(name="buffalo_l")
+available_providers = ort.get_available_providers()
+if "CUDAExecutionProvider" in available_providers:
+    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    ctx_id = 0
+else:
+    providers = ["CPUExecutionProvider"]
+    ctx_id = -1
+model = insightface.app.FaceAnalysis(name="buffalo_l", providers=providers)
 model.prepare(ctx_id=0, det_size=(320, 320))
-
-# === Carregar imagens de referência ===
-def buscar_imagens_recursivo(diretorio, extensoes={".jpg", ".jpeg", ".png"}):
-    arquivos = []
-    for root, _, files in os.walk(diretorio):
-        for file in files:
-            if os.path.splitext(file)[1].lower() in extensoes:
-                arquivos.append(os.path.join(root, file))
-    return arquivos
-
-imagens_referencia = buscar_imagens_recursivo("/mnt/Projeto_id_facial/PastaTeste/")  # <- pasta com seu banco
-embedding_db = []
-for img_path in imagens_referencia:
-    img = cv2.imread(img_path)
-    if img is None:
-        continue
-    faces_ref = model.get(img)
-    for i, f in enumerate(faces_ref):
-        embedding_db.append({
-            "id": f"{os.path.basename(img_path)}_face_{i}",
-            "embedding": f.embedding,
-            "path": img_path
-        })
 
 progresso = {"percent": 0}
 
-def processar_frame(frame, embedding_db, pessoas_encontradas):
+def carregar_indices():
+    indice_path = os.path.join(PASTA_INDICE, "indice_rostos.index")
+    nomes_path = os.path.join(PASTA_INDICE, "nomes.pkl")
+    
+    if os.path.exists(indice_path) and os.path.exists(nomes_path):
+        index = faiss.read_index(indice_path)
+        with open(nomes_path, "rb") as f:
+            nomes = pickle.load(f)
+        return index, nomes
+    
+    return None, None
+
+indexes,nomes = carregar_indices()
+
+
+def processar_frame(frame):
     resultados = []
-    yolo_result = yolo.predict(frame, conf=0.5, classes=[0], device="cuda")
+    resultado_indices = []
+    yolo_result = yolo.predict(frame, conf=0.5, classes=[0])
     for box in yolo_result[0].boxes:
         x1, y1, x2, y2 = map(int, box.xyxy[0])
         face_crop = frame[y1:y2, x1:x2]
         faces = model.get(face_crop)
         if len(faces) > 0:
-            embedding = faces[0].embedding
-            sims = [
-                (ref["id"], cosine_similarity([ref["embedding"]], [embedding])[0][0], ref["path"])
-                for ref in embedding_db
-                if ref["id"].split("_face_")[0] not in pessoas_encontradas
-            ]
-            if sims:
-                best_match = max(sims, key=lambda x: x[1])
-                if best_match[1] > 0.6:
-                    nome_img = best_match[0].split("_face_")[0]
-                    resultados.append((nome_img, best_match[2], face_crop))
+            embedding = faces[0].embedding.reshape(1, -1).astype('float32')
+            emb_norm = embedding / np.linalg.norm(embedding, axis=1, keepdims=True)
+            distances, indices = indexes.search(emb_norm, k=1)
+
+            for i, dist in enumerate(distances[0]):
+                print(f"Match {i+1}: distância = {dist:.4f}, nome = {nomes[indices[0][i]]}")
+            if dist <= 1.0:
+                resultado_indices.append(indices[0][i])
+
+            if resultado_indices:
+                result = [nomes[idx] for idx in resultado_indices]
+                resultados.append((result[0], face_crop))
+            
     return resultados
 
 def processar_video(video_path, batch_size=15):
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     imagens_detectadas = {}
-    pessoas_encontradas = set()
     frame_count = 0
     progresso["percent"] = 0
 
@@ -92,41 +100,39 @@ def processar_video(video_path, batch_size=15):
         frames_batch.append(frame)
         frame_indices.append(frame_count)
         frame_count += 1
-
+        resultado_indices = []
         # Quando atingir o tamanho do lote ou acabar o vídeo
         if len(frames_batch) == batch_size or not cap.isOpened():
             # Processa o lote de frames com YOLO
-            yolo_results = yolo.predict(frames_batch, conf=0.5, classes=[0], device="cuda")
+            yolo_results = yolo.predict(frames_batch, conf=0.5, classes=[0])
             for idx, yolo_result in enumerate(yolo_results):
                 frame = frames_batch[idx]
                 for box in yolo_result.boxes:
-                    if len(pessoas_encontradas) == len(embedding_db):
-                        break  # já encontrou todas, pode parar
 
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
                     face_crop = frame[y1:y2, x1:x2]
                     faces = model.get(face_crop)
+
                     if len(faces) > 0:
-                        embedding = faces[0].embedding
-                        sims = [
-                            (ref["id"], cosine_similarity([ref["embedding"]], [embedding])[0][0], ref["path"])
-                            for ref in embedding_db
-                            if ref["id"].split("_face_")[0] not in pessoas_encontradas
-                        ]
-                        if sims:
-                            best_match = max(sims, key=lambda x: x[1])
-                            if best_match[1] > 0.5:
-                                nome_img = best_match[0].split("_face_")[0]
-                                pessoas_encontradas.add(nome_img)
-                                recorte_nome = f"{nome_img}_frame_{frame_indices[idx]}.jpg"
-                                recorte_path = os.path.join(RESULT_FOLDER, recorte_nome)
-                                cv2.imwrite(recorte_path, face_crop)
-                                imagens_detectadas[nome_img] = {
-                                    "referencia": best_match[2],
+                        embedding = faces[0].embedding.reshape(1, -1).astype('float32')
+                        emb_norm = embedding / np.linalg.norm(embedding, axis=1, keepdims=True)
+                        distances, indices = indexes.search(emb_norm, k=1)
+                        
+                        for i, dist in enumerate(distances[0]):
+                            print(f"Match {i+1}: distância = {dist:.4f}, nome = {nomes[indices[0][i]]}")
+                        if dist <= 1.0:
+                            resultado_indices.append(indices[0][i])
+                            nome_img =uuid.uuid4().hex
+                            recorte_nome = f"{nome_img}_frame_{frame_indices[idx]}.jpg"
+                            recorte_path = os.path.join(RESULT_FOLDER, recorte_nome)
+                            cv2.imwrite(recorte_path, face_crop)
+
+                        result = [nomes[idx] for idx in resultado_indices]
+
+                        imagens_detectadas[nome_img] = {
+                                    "referencia": result[0],
                                     "recorte": recorte_path
                                 }
-            frames_batch = []
-            frame_indices = []
 
         progresso["percent"] = int((frame_count / total_frames) * 100)
 
@@ -144,7 +150,7 @@ def worker_identificacao():
         frame = frame_queue.get()
         if frame is None:
             break  # Para a thread
-        resultados = processar_frame(frame, embedding_db, pessoas_encontradas)
+        resultados = processar_frame(frame)
         if resultados:
             nome_img, referencia, face_crop = resultados[0]
             mensagem = f"Pessoa reconhecida: {nome_img}"
@@ -172,15 +178,16 @@ def index():
 
             # copia imagens para pasta static/resultados
             imagens_para_exibir = []
-            for nome, dados in imagens_detectadas.items():
-                # Copia imagem de referência
-                destino_ref = os.path.join(RESULT_FOLDER, os.path.basename(dados["referencia"]))
-                if not os.path.exists(destino_ref):
-                    os.system(f'cp "{dados["referencia"]}" "{destino_ref}"')
+            for chave, dados in imagens_detectadas.items():
+                # Copia recorte também
+                destino_rec = os.path.join(RESULT_FOLDER, os.path.basename(dados["recorte"]))
+                if not os.path.exists(destino_rec):
+                    shutil.copy(dados["recorte"], destino_rec)
+
                 # Adiciona caminhos para exibição
                 imagens_para_exibir.append({
-                    "referencia": url_for("static", filename=f"resultados/{os.path.basename(dados["referencia"])}"),
-                    "recorte": url_for("static", filename=f"resultados/{os.path.basename(dados["recorte"])}")
+                    "referencia": dados['referencia'],
+                    "recorte": url_for("static", filename=f"resultados/{os.path.basename(dados['recorte'])}")
                 })
 
             return render_template("resultado.html", imagens=imagens_para_exibir)
@@ -200,15 +207,14 @@ def processar_frame_webcam():
     filepath = os.path.join(app.config["UPLOAD_FOLDER"], filename)
     file.save(filepath)
     frame = cv2.imread(filepath)
-    pessoas_encontradas = set()
-    resultados = processar_frame(frame, embedding_db, pessoas_encontradas)
+    resultados = processar_frame(frame)
     pessoas = []
-    for nome_img, referencia, face_crop in resultados:
+    for nome_img, face_crop in resultados:
         # Foto recortada do vídeo
         _, buffer = cv2.imencode('.jpg', face_crop)
         img_base64 = base64.b64encode(buffer).decode('utf-8')
         # Foto arquivada (referência)
-        ref_img = cv2.imread(referencia)
+        ref_img = cv2.imread(nome_img)
         _, ref_buffer = cv2.imencode('.jpg', ref_img)
         ref_base64 = base64.b64encode(ref_buffer).decode('utf-8')
         pessoas.append({
@@ -232,5 +238,19 @@ def processar_frame_webcam():
 def webcam():
     return render_template("webcam.html")
 
+# rota pra servir arquivos de rostos_dataset
+@app.route('/rostos_dataset/<path:filename>')
+def serve_rostos_dataset(filename):
+    return send_from_directory('/app/rostos_dataset', filename)
+
+# rota pra servir arquivos de novas_imagens
+@app.route('/novas_imagens/<path:filename>')
+def serve_novas_imagens(filename):
+    return send_from_directory('/app/novas_imagens', filename)
+
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(host="0.0.0.0", port=5000, ssl_context=('/app/cert.pem','/app/key.pem'))
+
+
+
+

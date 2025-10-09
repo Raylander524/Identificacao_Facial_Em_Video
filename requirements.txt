@@ -7,3 +7,4 @@ insightface
 scikit-learn
 flask
 Werkzeug
+faiss-cpu
