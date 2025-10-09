@@ -288,16 +288,15 @@ def webcam():
 # rota pra servir arquivos de rostos_dataset
 @app.route('/rostos_dataset/<path:filename>')
 def serve_rostos_dataset(filename):
-    return send_from_directory('rostos_dataset', filename)
+    return send_from_directory('/app/rostos_dataset', filename)
 
 # rota pra servir arquivos de novas_imagens
 @app.route('/novas_imagens/<path:filename>')
 def serve_novas_imagens(filename):
-    return send_from_directory('novas_imagens', filename)
+    return send_from_directory('/app/novas_imagens', filename)
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, ssl_context=('cert.pem','key.pem'))
-
+    app.run(host="0.0.0.0", port=5000, ssl_context=('/app/cert.pem','/app/key.pem'))
 
 
 
