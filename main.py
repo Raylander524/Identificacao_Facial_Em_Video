@@ -198,6 +198,53 @@ def index():
 def get_progresso():
     return jsonify(progresso)
 
+@app.route("/analisar_foto", methods=["POST"])
+def analisar_foto():
+    if "foto" not in request.files:
+        return jsonify({"mensagem": "Nenhuma foto enviada.", "encontrado": False})
+
+    file = request.files["foto"]
+    quantidade = int(request.form.get("quantidade", 5))
+    filename = secure_filename(file.filename)
+    filepath = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+    file.save(filepath)
+
+    frame = cv2.imread(filepath)
+    if frame is None:
+        return jsonify({"mensagem": "Erro ao ler a imagem enviada.", "encontrado": False})
+
+    faces = model.get(frame)
+    if len(faces) == 0:
+        return render_template("resultado_foto.html", resultados=[])
+
+    resultados = []
+    for face in faces:
+        embedding = face.embedding.reshape(1, -1).astype("float32")
+        emb_norm = embedding / np.linalg.norm(embedding, axis=1, keepdims=True)
+
+        if indexes is None or nomes is None:
+            return render_template("resultado_foto.html", resultados=[])
+
+        distances, indices = indexes.search(emb_norm, k=quantidade)
+
+        for i, dist in enumerate(distances[0]):
+            if dist <= 1.0:
+                nome_ref = nomes[indices[0][i]]
+                # Recorte do rosto em base64
+                x1, y1, x2, y2 = map(int, face.bbox)
+                face_crop = frame[y1:y2, x1:x2]
+                _, buffer = cv2.imencode(".jpg", face_crop)
+                img_base64 = base64.b64encode(buffer).decode("utf-8")
+
+                resultados.append({
+                    "nome": nome_ref,
+                    "distancia": float(dist),
+                    "foto": img_base64
+                })
+
+    return render_template("resultado_foto.html", resultados=resultados)
+
+
 @app.route("/processar_frame", methods=["POST"])
 def processar_frame_webcam():
     if "frame" not in request.files:
@@ -241,15 +288,15 @@ def webcam():
 # rota pra servir arquivos de rostos_dataset
 @app.route('/rostos_dataset/<path:filename>')
 def serve_rostos_dataset(filename):
-    return send_from_directory('/app/rostos_dataset', filename)
+    return send_from_directory('rostos_dataset', filename)
 
 # rota pra servir arquivos de novas_imagens
 @app.route('/novas_imagens/<path:filename>')
 def serve_novas_imagens(filename):
-    return send_from_directory('/app/novas_imagens', filename)
+    return send_from_directory('novas_imagens', filename)
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, ssl_context=('/app/cert.pem','/app/key.pem'))
+    app.run(host="0.0.0.0", port=5000, ssl_context=('cert.pem','key.pem'))
 
 
 
