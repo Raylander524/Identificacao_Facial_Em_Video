@@ -77,9 +77,10 @@ def processar_frame(frame):
             
     return resultados
 
-def processar_video(video_path, batch_size=15):
+def processar_video(video_path, batch_size=32):
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
     imagens_detectadas = {}
     frame_count = 0
     progresso["percent"] = 0
@@ -87,58 +88,70 @@ def processar_video(video_path, batch_size=15):
     frames_batch = []
     frame_indices = []
 
-    frame_skip = 10  # processa 1 a cada 10 frames
+    frame_skip = 15  # processa 1 a cada 10 frames
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
+
         if frame_count % frame_skip != 0:
             frame_count += 1
             continue
 
-        # frame = cv2.resize(frame, (640, 360))
+        frame = cv2.resize(frame, (800, 450))
         frames_batch.append(frame)
         frame_indices.append(frame_count)
         frame_count += 1
-        resultado_indices = []
-        # Quando atingir o tamanho do lote ou acabar o vídeo
-        if len(frames_batch) == batch_size or not cap.isOpened():
-            # Processa o lote de frames com YOLO
-            yolo_results = yolo.predict(frames_batch, conf=0.5, classes=[0])
-            for idx, yolo_result in enumerate(yolo_results):
-                frame = frames_batch[idx]
-                for box in yolo_result.boxes:
 
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    face_crop = frame[y1:y2, x1:x2]
-                    faces = model.get(face_crop)
-
-                    if len(faces) > 0:
-                        embedding = faces[0].embedding.reshape(1, -1).astype('float32')
-                        emb_norm = embedding / np.linalg.norm(embedding, axis=1, keepdims=True)
-                        distances, indices = indexes.search(emb_norm, k=1)
-                        
-                        for i, dist in enumerate(distances[0]):
-                            print(f"Match {i+1}: distância = {dist:.4f}, nome = {nomes[indices[0][i]]}")
-                        if dist <= 1.0:
-                            resultado_indices.append(indices[0][i])
-                            nome_img =uuid.uuid4().hex
-                            recorte_nome = f"{nome_img}_frame_{frame_indices[idx]}.jpg"
-                            recorte_path = os.path.join(RESULT_FOLDER, recorte_nome)
-                            cv2.imwrite(recorte_path, face_crop)
-
-                        result = [nomes[idx] for idx in resultado_indices]
-
-                        imagens_detectadas[nome_img] = {
-                                    "referencia": result[0],
-                                    "recorte": recorte_path
-                                }
+        # Processa o batch assim que atingir o tamanho máximo
+        if len(frames_batch) == batch_size:
+            print(f"Processando lote com {len(frames_batch)} frames...")
+            processar_lote(frames_batch, frame_indices, imagens_detectadas)
+            frames_batch.clear()
+            frame_indices.clear()
 
         progresso["percent"] = int((frame_count / total_frames) * 100)
+
+    if len(frames_batch) > 0:
+        processar_lote(frames_batch, frame_indices, imagens_detectadas)
 
     cap.release()
     progresso["percent"] = 100
     return imagens_detectadas
+
+
+def processar_lote(frames_batch, frame_indices, imagens_detectadas):
+    yolo_results = yolo.predict(frames_batch, conf=0.5, classes=[0])
+
+    for idx, yolo_result in enumerate(yolo_results):
+        frame = frames_batch[idx]
+        print(f"Frame {frame_indices[idx]} -> {len(yolo_result.boxes)} detecções")
+
+        for box in yolo_result.boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            face_crop = frame[y1:y2, x1:x2]
+            faces = model.get(face_crop)
+
+            if len(faces) == 0:
+                continue
+
+            embedding = faces[0].embedding.reshape(1, -1).astype('float32')
+            emb_norm = embedding / np.linalg.norm(embedding, axis=1, keepdims=True)
+            distances, indices = indexes.search(emb_norm, k=1)
+
+            for i, dist in enumerate(distances[0]):
+                print(f"Match {i+1}: distância = {dist:.4f}, nome = {nomes[indices[0][i]]}")
+
+                if dist <= 1.0:
+                    nome_img = uuid.uuid4().hex
+                    recorte_nome = f"{nome_img}frame{frame_indices[idx]}.jpg"
+                    recorte_path = os.path.join(RESULT_FOLDER, recorte_nome)
+                    cv2.imwrite(recorte_path, face_crop)
+
+                    imagens_detectadas[nome_img] = {
+                        "referencia": nomes[indices[0][i]],
+                        "recorte": recorte_path,
+                    }
 
 # Fila para frames recebidos
 frame_queue = queue.Queue()
@@ -288,15 +301,15 @@ def webcam():
 # rota pra servir arquivos de rostos_dataset
 @app.route('/rostos_dataset/<path:filename>')
 def serve_rostos_dataset(filename):
-    return send_from_directory('/app/rostos_dataset', filename)
+    return send_from_directory('rostos_dataset', filename)
 
 # rota pra servir arquivos de novas_imagens
 @app.route('/novas_imagens/<path:filename>')
 def serve_novas_imagens(filename):
-    return send_from_directory('/app/novas_imagens', filename)
+    return send_from_directory('novas_imagens', filename)
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, ssl_context=('/app/cert.pem','/app/key.pem'))
+    app.run(host="0.0.0.0", port=5000, ssl_context=('cert.pem','key.pem'))
 
 
 

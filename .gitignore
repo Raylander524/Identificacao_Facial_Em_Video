@@ -1,0 +1,7 @@
+
+# Ignorar pastas de build
+/static/
+/uploads/
+/index/
+
+
