@@ -122,23 +122,18 @@ def processar_video(video_path, batch_size=15):
                             print(f"Match {i+1}: distância = {dist:.4f}, nome = {nomes[indices[0][i]]}")
                         if dist <= 1.0:
                             resultado_indices.append(indices[0][i])
-                            # salva recorte do rosto do frame atual
-                            recorte_nome = f"frame_{frame_indices[idx]}_{indices[0][i]}.jpg"
+                            nome_img =uuid.uuid4().hex
+                            recorte_nome = f"{nome_img}_frame_{frame_indices[idx]}.jpg"
                             recorte_path = os.path.join(RESULT_FOLDER, recorte_nome)
                             cv2.imwrite(recorte_path, face_crop)
 
-                        # após checar distâncias, monta lista de nomes (se houver)
-                        result = [nomes[idx] for idx in resultado_indices] if resultado_indices else []
+                        result = [nomes[idx] for idx in resultado_indices]
 
-                        # só registra se houver ao menos um nome encontrado
-                        if result:
-                            referencia_nome = result[0]
-                            # usa o nome da referência como chave para não duplicar a mesma pessoa
-                            if referencia_nome not in imagens_detectadas:
-                                imagens_detectadas[referencia_nome] = {
-                                    "referencia": referencia_nome,
+                        imagens_detectadas[nome_img] = {
+                                    "referencia": result[0],
                                     "recorte": recorte_path
                                 }
+
         progresso["percent"] = int((frame_count / total_frames) * 100)
 
     cap.release()
@@ -233,7 +228,7 @@ def analisar_foto():
         distances, indices = indexes.search(emb_norm, k=quantidade)
 
         for i, dist in enumerate(distances[0]):
-            if dist <= 2.0:
+            if dist <= 1.0:
                 nome_ref = nomes[indices[0][i]]
                 # Recorte do rosto em base64
                 x1, y1, x2, y2 = map(int, face.bbox)
@@ -293,15 +288,15 @@ def webcam():
 # rota pra servir arquivos de rostos_dataset
 @app.route('/rostos_dataset/<path:filename>')
 def serve_rostos_dataset(filename):
-    return send_from_directory('rostos_dataset', filename)
+    return send_from_directory('/app/rostos_dataset', filename)
 
 # rota pra servir arquivos de novas_imagens
 @app.route('/novas_imagens/<path:filename>')
 def serve_novas_imagens(filename):
-    return send_from_directory('novas_imagens', filename)
+    return send_from_directory('/app/novas_imagens', filename)
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, ssl_context=('cert.pem','key.pem'))
+    app.run(host="0.0.0.0", port=5000, ssl_context=('/app/cert.pem','/app/key.pem'))
 
 
 
