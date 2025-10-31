@@ -1,0 +1,12 @@
+version: "3.9"
+
+services:
+  app:
+    image: jeanmag/video_face_recognition_arida:latest
+    container_name: video_face_recognition_app
+    ports:
+      - "80:8000"
+    volumes:
+    - /mnt/sda1/datasets:/rostos_dataset
+    - /home/faroldigital/reconhecimento_facial/novas_imagens:/novas_imagens
+    - /home/faroldigital/reconhecimento_facial/index:/index
