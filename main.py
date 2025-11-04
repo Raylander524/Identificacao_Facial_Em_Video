@@ -142,7 +142,7 @@ def processar_lote(frames_batch, frame_indices, imagens_detectadas):
             for i, dist in enumerate(distances[0]):
                 print(f"Match {i+1}: distância = {dist:.4f}, nome = {nomes[indices[0][i]]}")
 
-                if dist <= 1.0:
+                if dist <= 0.7:
                     nome_img = uuid.uuid4().hex
                     recorte_nome = f"{nome_img}frame{frame_indices[idx]}.jpg"
                     recorte_path = os.path.join(RESULT_FOLDER, recorte_nome)
@@ -241,7 +241,7 @@ def analisar_foto():
         distances, indices = indexes.search(emb_norm, k=quantidade)
 
         for i, dist in enumerate(distances[0]):
-            if dist <= 1.0:
+            if dist <= 0.7:
                 nome_ref = nomes[indices[0][i]]
                 # Recorte do rosto em base64
                 x1, y1, x2, y2 = map(int, face.bbox)
@@ -307,6 +307,10 @@ def serve_rostos_dataset(filename):
 @app.route('/novas_imagens/<path:filename>')
 def serve_novas_imagens(filename):
     return send_from_directory('novas_imagens', filename)
+
+@app.route("/ocr")
+def ocr():
+    return render_template("ocr.html")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, ssl_context=('cert.pem','key.pem'))
