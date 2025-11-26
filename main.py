@@ -1,4 +1,5 @@
 import numpy as np
+import requests
 from flask import Flask, request, render_template, url_for, jsonify,send_from_directory
 import os
 import cv2
@@ -22,6 +23,7 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(RESULT_FOLDER, exist_ok=True)
 PASTA_INDICE = "index"
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+OCR_API_URL = "http://200.129.44.250:9000/process"   # pode ser "http://localhost:9000" se for rodar local local
 
 
 # === Carregar modelos ===
@@ -311,6 +313,21 @@ def serve_novas_imagens(filename):
 @app.route("/ocr")
 def ocr():
     return render_template("ocr.html")
+
+@app.route("/api/ocr", methods=["POST"])
+def proxy_ocr():
+    if "file" not in request.files:
+        return jsonify({"error": "Nenhum arquivo enviado."}), 400
+
+    file = request.files["file"]
+    files = {"file": (file.filename, file.stream, file.content_type)}
+
+    try:
+        # requisição interna pro FastAPI
+        resp = requests.post(OCR_API_URL, files=files)
+        return jsonify(resp.json()), resp.status_code
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, ssl_context=('cert.pem','key.pem'))
