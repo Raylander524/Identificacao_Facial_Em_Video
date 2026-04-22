@@ -9,11 +9,18 @@ from werkzeug.utils import secure_filename
 import threading
 import queue
 import base64
-import faiss
-import pickle
 import uuid
 import shutil
+import time
 import onnxruntime as ort
+from pymilvus import (
+    Collection,
+    CollectionSchema,
+    DataType,
+    FieldSchema,
+    connections,
+    utility,
+)
 
 # === Configuração Flask ===
 app = Flask(__name__)
@@ -24,6 +31,14 @@ os.makedirs(RESULT_FOLDER, exist_ok=True)
 PASTA_INDICE = "index"
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 OCR_API_URL = "http://200.129.44.250:9000/process"   # pode ser "http://localhost:9000" se for rodar local local
+MILVUS_HOST = os.getenv("MILVUS_HOST", "milvus-standalone")
+MILVUS_PORT = os.getenv("MILVUS_PORT", "19530")
+MILVUS_COLLECTION = os.getenv("MILVUS_COLLECTION", "rostos_embeddings")
+EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "512"))
+MILVUS_COSINE_THRESHOLD = 0.5
+ROSTOS_DATASET_DIR = os.getenv("ROSTOS_DATASET_DIR", "")
+IMAGENS_ADICIONADAS_DIR = os.getenv("IMAGENS_ADICIONADAS_DIR", "imagens_adicionadas")
+os.makedirs(IMAGENS_ADICIONADAS_DIR, exist_ok=True)
 
 
 # === Carregar modelos ===
@@ -40,42 +55,219 @@ model.prepare(ctx_id=0, det_size=(320, 320))
 
 progresso = {"percent": 0}
 
-def carregar_indices():
-    indice_path = os.path.join(PASTA_INDICE, "indice_rostos.index")
-    nomes_path = os.path.join(PASTA_INDICE, "nomes.pkl")
-    
-    if os.path.exists(indice_path) and os.path.exists(nomes_path):
-        index = faiss.read_index(indice_path)
-        with open(nomes_path, "rb") as f:
-            nomes = pickle.load(f)
-        return index, nomes
-    
-    return None, None
 
-indexes,nomes = carregar_indices()
+def obter_diretorio_dataset():
+    candidatos = [ROSTOS_DATASET_DIR, "rostos_dataset", "/rostos_dataset"]
+    for caminho in candidatos:
+        if caminho and os.path.isdir(caminho):
+            return caminho
+    return None
+
+
+def referencia_para_url(caminho):
+    caminho_norm = os.path.abspath(caminho)
+    dataset_dir = obter_diretorio_dataset()
+    if dataset_dir:
+        dataset_abs = os.path.abspath(dataset_dir)
+        if caminho_norm.startswith(dataset_abs + os.sep):
+            relativo = os.path.relpath(caminho_norm, dataset_abs).replace("\\", "/")
+            return f"/rostos_dataset/{relativo}"
+
+    imagens_add_abs = os.path.abspath(IMAGENS_ADICIONADAS_DIR)
+    if caminho_norm.startswith(imagens_add_abs + os.sep):
+        relativo = os.path.relpath(caminho_norm, imagens_add_abs).replace("\\", "/")
+        return f"/imagens_adicionadas/{relativo}"
+
+    return caminho
+
+
+def referencia_para_arquivo(referencia):
+    if referencia.startswith("/imagens_adicionadas/"):
+        relativo = referencia.replace("/imagens_adicionadas/", "", 1)
+        return os.path.join(IMAGENS_ADICIONADAS_DIR, relativo)
+
+    if referencia.startswith("/rostos_dataset/"):
+        dataset_dir = obter_diretorio_dataset()
+        if dataset_dir:
+            relativo = referencia.replace("/rostos_dataset/", "", 1)
+            return os.path.join(dataset_dir, relativo)
+
+    return referencia
+
+
+def listar_imagens_dataset(dataset_dir):
+    extensoes = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+    for raiz, _, arquivos in os.walk(dataset_dir):
+        for arquivo in arquivos:
+            if os.path.splitext(arquivo)[1].lower() in extensoes:
+                yield os.path.join(raiz, arquivo)
+
+
+def extrair_embedding_principal(imagem):
+    faces = model.get(imagem)
+    if len(faces) == 0:
+        return None
+
+    # Escolhe o maior rosto quando há múltiplas detecções na imagem.
+    face = max(
+        faces,
+        key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]),
+    )
+    embedding = face.embedding.astype("float32")
+    norma = np.linalg.norm(embedding)
+    if norma == 0:
+        return None
+    return embedding / norma
+
+
+def popular_collection_dataset(collection, dataset_dir, batch_size=128):
+    referencias_batch = []
+    embeddings_batch = []
+    total_imagens = 0
+    total_inseridos = 0
+
+    for caminho_img in listar_imagens_dataset(dataset_dir):
+        total_imagens += 1
+        imagem = cv2.imread(caminho_img)
+        if imagem is None:
+            continue
+
+        embedding = extrair_embedding_principal(imagem)
+        if embedding is None:
+            continue
+
+        referencias_batch.append(referencia_para_url(caminho_img))
+        embeddings_batch.append(embedding.tolist())
+
+        if len(referencias_batch) >= batch_size:
+            collection.insert([referencias_batch, embeddings_batch])
+            total_inseridos += len(referencias_batch)
+            referencias_batch.clear()
+            embeddings_batch.clear()
+
+    if referencias_batch:
+        collection.insert([referencias_batch, embeddings_batch])
+        total_inseridos += len(referencias_batch)
+
+    if total_inseridos > 0:
+        collection.flush()
+
+    print(
+        f"Carga inicial do Milvus concluída: {total_inseridos} embeddings "
+        f"a partir de {total_imagens} imagens do dataset."
+    )
+
+def carregar_collection_milvus():
+    ultima_excecao = None
+    for tentativa in range(15):
+        try:
+            connections.connect(alias="default", host=MILVUS_HOST, port=MILVUS_PORT)
+            break
+        except Exception as e:
+            ultima_excecao = e
+            print(f"Milvus indisponível (tentativa {tentativa + 1}/15): {e}")
+            time.sleep(2)
+    else:
+        print(f"Falha ao conectar no Milvus: {ultima_excecao}")
+        return None
+
+    colecao_criada = False
+    if not utility.has_collection(MILVUS_COLLECTION):
+        fields = [
+            FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
+            FieldSchema(name="nome", dtype=DataType.VARCHAR, max_length=1024),
+            FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=EMBEDDING_DIM),
+        ]
+        schema = CollectionSchema(fields=fields, description="Embeddings faciais")
+        collection = Collection(name=MILVUS_COLLECTION, schema=schema)
+        colecao_criada = True
+    else:
+        collection = Collection(name=MILVUS_COLLECTION)
+
+    if colecao_criada:
+        dataset_dir = obter_diretorio_dataset()
+        if dataset_dir is None:
+            print(
+                "Coleção Milvus criada, mas o diretório rostos_dataset não foi encontrado."
+            )
+        else:
+            print(f"Coleção Milvus não existia. Carregando dataset de: {dataset_dir}")
+            popular_collection_dataset(collection, dataset_dir)
+
+    if len(collection.indexes) == 0:
+        try:
+            collection.create_index(
+                field_name="embedding",
+                index_params={
+                    "index_type": "IVF_FLAT",
+                    "metric_type": "COSINE",
+                    "params": {"nlist": 128},
+                },
+            )
+        except Exception as e:
+            print(f"Não foi possível criar índice IVF_FLAT/COSINE: {e}")
+
+    collection.load()
+    return collection
+
+
+def buscar_similares(collection, embedding, k=1):
+    if collection is None:
+        return []
+
+    embedding_norm = embedding / np.linalg.norm(embedding)
+    resultados = collection.search(
+        data=[embedding_norm.tolist()],
+        anns_field="embedding",
+        param={"metric_type": "COSINE", "params": {"nprobe": 16}},
+        limit=k,
+        output_fields=["nome"],
+    )
+
+    similares = []
+    for hit in resultados[0]:
+        similaridade = float(hit.distance)
+        if similaridade > MILVUS_COSINE_THRESHOLD:
+            similares.append({
+                "nome": hit.entity.get("nome"),
+                "similaridade": similaridade,
+            })
+
+    return similares
+
+
+def inserir_referencia_no_milvus(collection, referencia, embedding):
+    if collection is None:
+        return False
+
+    embedding_norm = embedding / np.linalg.norm(embedding)
+    collection.insert([[referencia], [embedding_norm.tolist()]])
+    collection.flush()
+    return True
+
+
+collection_rostos = carregar_collection_milvus()
 
 
 def processar_frame(frame):
     resultados = []
-    resultado_indices = []
     yolo_result = yolo.predict(frame, conf=0.5, classes=[0])
     for box in yolo_result[0].boxes:
         x1, y1, x2, y2 = map(int, box.xyxy[0])
         face_crop = frame[y1:y2, x1:x2]
         faces = model.get(face_crop)
         if len(faces) > 0:
-            embedding = faces[0].embedding.reshape(1, -1).astype('float32')
-            emb_norm = embedding / np.linalg.norm(embedding, axis=1, keepdims=True)
-            distances, indices = indexes.search(emb_norm, k=1)
+            embedding = faces[0].embedding.astype("float32")
+            similares = buscar_similares(collection_rostos, embedding, k=1)
 
-            for i, dist in enumerate(distances[0]):
-                print(f"Match {i+1}: distância = {dist:.4f}, nome = {nomes[indices[0][i]]}")
-            if dist <= 1.0:
-                resultado_indices.append(indices[0][i])
+            for i, similar in enumerate(similares):
+                print(
+                    f"Match {i+1}: similaridade = {similar['similaridade']:.4f}, "
+                    f"nome = {similar['nome']}"
+                )
 
-            if resultado_indices:
-                result = [nomes[idx] for idx in resultado_indices]
-                resultados.append((result[0], face_crop))
+            if similares:
+                resultados.append((similares[0]["nome"], face_crop))
             
     return resultados
 
@@ -137,21 +329,23 @@ def processar_lote(frames_batch, frame_indices, imagens_detectadas):
             if len(faces) == 0:
                 continue
 
-            embedding = faces[0].embedding.reshape(1, -1).astype('float32')
-            emb_norm = embedding / np.linalg.norm(embedding, axis=1, keepdims=True)
-            distances, indices = indexes.search(emb_norm, k=1)
+            embedding = faces[0].embedding.astype("float32")
+            similares = buscar_similares(collection_rostos, embedding, k=1)
 
-            for i, dist in enumerate(distances[0]):
-                print(f"Match {i+1}: distância = {dist:.4f}, nome = {nomes[indices[0][i]]}")
+            for i, similar in enumerate(similares):
+                print(
+                    f"Match {i+1}: similaridade = {similar['similaridade']:.4f}, "
+                    f"nome = {similar['nome']}"
+                )
 
-                if dist <= 0.7:
+                if similar["similaridade"] > MILVUS_COSINE_THRESHOLD:
                     nome_img = uuid.uuid4().hex
                     recorte_nome = f"{nome_img}frame{frame_indices[idx]}.jpg"
                     recorte_path = os.path.join(RESULT_FOLDER, recorte_nome)
                     cv2.imwrite(recorte_path, face_crop)
 
                     imagens_detectadas[nome_img] = {
-                        "referencia": nomes[indices[0][i]],
+                        "referencia": similar["nome"],
                         "recorte": recorte_path,
                     }
 
@@ -160,14 +354,13 @@ frame_queue = queue.Queue()
 result_queue = queue.Queue()
 
 def worker_identificacao():
-    pessoas_encontradas = set()
     while True:
         frame = frame_queue.get()
         if frame is None:
             break  # Para a thread
         resultados = processar_frame(frame)
         if resultados:
-            nome_img, referencia, face_crop = resultados[0]
+            nome_img, face_crop = resultados[0]
             mensagem = f"Pessoa reconhecida: {nome_img}"
             encontrado = True
         else:
@@ -219,7 +412,11 @@ def analisar_foto():
         return jsonify({"mensagem": "Nenhuma foto enviada.", "encontrado": False})
 
     file = request.files["foto"]
-    quantidade = int(request.form.get("quantidade", 5))
+    try:
+        quantidade = int(request.form.get("quantidade", 5))
+    except (TypeError, ValueError):
+        quantidade = 5
+    quantidade = max(1, quantidade)
     filename = secure_filename(file.filename)
     filepath = os.path.join(app.config["UPLOAD_FOLDER"], filename)
     file.save(filepath)
@@ -232,32 +429,73 @@ def analisar_foto():
     if len(faces) == 0:
         return render_template("resultado_foto.html", resultados=[])
 
+    # Usa o maior rosto da imagem de consulta para buscar os mais similares.
+    face_consulta = max(
+        faces,
+        key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]),
+    )
+
     resultados = []
-    for face in faces:
-        embedding = face.embedding.reshape(1, -1).astype("float32")
-        emb_norm = embedding / np.linalg.norm(embedding, axis=1, keepdims=True)
+    if collection_rostos is None:
+        return render_template("resultado_foto.html", resultados=[])
 
-        if indexes is None or nomes is None:
-            return render_template("resultado_foto.html", resultados=[])
+    embedding = face_consulta.embedding.astype("float32")
+    similares = buscar_similares(collection_rostos, embedding, k=quantidade)
 
-        distances, indices = indexes.search(emb_norm, k=quantidade)
+    # Recorte do rosto de consulta em base64
+    x1, y1, x2, y2 = map(int, face_consulta.bbox)
+    face_crop = frame[y1:y2, x1:x2]
+    _, buffer = cv2.imencode(".jpg", face_crop)
+    img_base64 = base64.b64encode(buffer).decode("utf-8")
 
-        for i, dist in enumerate(distances[0]):
-            if dist <= 0.7:
-                nome_ref = nomes[indices[0][i]]
-                # Recorte do rosto em base64
-                x1, y1, x2, y2 = map(int, face.bbox)
-                face_crop = frame[y1:y2, x1:x2]
-                _, buffer = cv2.imencode(".jpg", face_crop)
-                img_base64 = base64.b64encode(buffer).decode("utf-8")
-
-                resultados.append({
-                    "nome": nome_ref,
-                    "distancia": float(dist),
-                    "foto": img_base64
-                })
+    for similar in similares[:quantidade]:
+        resultados.append({
+            "nome": similar["nome"],
+            "distancia": float(similar["similaridade"]),
+            "foto": img_base64
+        })
 
     return render_template("resultado_foto.html", resultados=resultados)
+
+
+@app.route("/adicionar_referencia", methods=["POST"])
+def adicionar_referencia():
+    if "foto" not in request.files:
+        return jsonify({"mensagem": "Nenhuma foto enviada.", "adicionada": False}), 400
+
+    if collection_rostos is None:
+        return jsonify({"mensagem": "Milvus indisponível.", "adicionada": False}), 503
+
+    file = request.files["foto"]
+    if file.filename == "":
+        return jsonify({"mensagem": "Arquivo inválido.", "adicionada": False}), 400
+
+    extensao = os.path.splitext(secure_filename(file.filename))[1].lower() or ".jpg"
+    nome_arquivo = f"{uuid.uuid4().hex}{extensao}"
+    caminho_salvo = os.path.join(IMAGENS_ADICIONADAS_DIR, nome_arquivo)
+    file.save(caminho_salvo)
+
+    imagem = cv2.imread(caminho_salvo)
+    if imagem is None:
+        os.remove(caminho_salvo)
+        return jsonify({"mensagem": "Erro ao ler a imagem enviada.", "adicionada": False}), 400
+
+    embedding = extrair_embedding_principal(imagem)
+    if embedding is None:
+        os.remove(caminho_salvo)
+        return jsonify({"mensagem": "Nenhum rosto detectado na imagem.", "adicionada": False}), 400
+
+    referencia_url = referencia_para_url(caminho_salvo)
+    inserido = inserir_referencia_no_milvus(collection_rostos, referencia_url, embedding)
+    if not inserido:
+        os.remove(caminho_salvo)
+        return jsonify({"mensagem": "Falha ao inserir no Milvus.", "adicionada": False}), 500
+
+    return jsonify({
+        "mensagem": "Imagem adicionada e indexada com sucesso.",
+        "adicionada": True,
+        "referencia": referencia_url,
+    })
 
 
 @app.route("/processar_frame", methods=["POST"])
@@ -276,7 +514,10 @@ def processar_frame_webcam():
         _, buffer = cv2.imencode('.jpg', face_crop)
         img_base64 = base64.b64encode(buffer).decode('utf-8')
         # Foto arquivada (referência)
-        ref_img = cv2.imread(nome_img)
+        ref_img_path = referencia_para_arquivo(nome_img)
+        ref_img = cv2.imread(ref_img_path)
+        if ref_img is None:
+            continue
         _, ref_buffer = cv2.imencode('.jpg', ref_img)
         ref_base64 = base64.b64encode(ref_buffer).decode('utf-8')
         pessoas.append({
@@ -303,12 +544,20 @@ def webcam():
 # rota pra servir arquivos de rostos_dataset
 @app.route('/rostos_dataset/<path:filename>')
 def serve_rostos_dataset(filename):
-    return send_from_directory('rostos_dataset', filename)
+    dataset_dir = obter_diretorio_dataset()
+    if dataset_dir is None:
+        return jsonify({"error": "Diretório rostos_dataset não encontrado."}), 404
+    return send_from_directory(dataset_dir, filename)
 
 # rota pra servir arquivos de novas_imagens
 @app.route('/novas_imagens/<path:filename>')
 def serve_novas_imagens(filename):
     return send_from_directory('novas_imagens', filename)
+
+
+@app.route('/imagens_adicionadas/<path:filename>')
+def serve_imagens_adicionadas(filename):
+    return send_from_directory(IMAGENS_ADICIONADAS_DIR, filename)
 
 @app.route("/ocr")
 def ocr():

@@ -94,6 +94,12 @@
           <button type="submit" class="btn btn-success btn-lg w-100">
             <i class="bi bi-search icon-btn"></i>Enviar Foto para Análise
           </button>
+
+          <button type="button" id="btn-adicionar-banco" class="btn btn-outline-primary btn-lg w-100 mt-2">
+            <i class="bi bi-database-add icon-btn"></i>Adicionar Foto ao Banco
+          </button>
+
+          <div id="status-adicao-banco" class="alert mt-3 d-none" role="alert"></div>
         </form>
       </div>
 
@@ -137,6 +143,48 @@
               if (data.percent < 100) setTimeout(atualizarProgresso, 1000);
             });
         }
+
+        // ---- Adicionar foto ao banco ----
+        const btnAdicionarBanco = document.getElementById("btn-adicionar-banco");
+        const statusAdicaoBanco = document.getElementById("status-adicao-banco");
+        const formFoto = document.getElementById("form-foto");
+
+        btnAdicionarBanco.addEventListener("click", async function() {
+          const fotoInput = formFoto.querySelector('input[name="foto"]');
+          if (!fotoInput || !fotoInput.files || fotoInput.files.length === 0) {
+            statusAdicaoBanco.className = "alert alert-warning mt-3";
+            statusAdicaoBanco.textContent = "Selecione uma imagem antes de adicionar ao banco.";
+            return;
+          }
+
+          const fd = new FormData();
+          fd.append("foto", fotoInput.files[0]);
+
+          btnAdicionarBanco.disabled = true;
+          statusAdicaoBanco.className = "alert alert-info mt-3";
+          statusAdicaoBanco.textContent = "Enviando imagem e indexando no Milvus...";
+
+          try {
+            const response = await fetch("/adicionar_referencia", {
+              method: "POST",
+              body: fd,
+            });
+            const data = await response.json();
+
+            if (response.ok && data.adicionada) {
+              statusAdicaoBanco.className = "alert alert-success mt-3";
+              statusAdicaoBanco.textContent = data.mensagem;
+            } else {
+              statusAdicaoBanco.className = "alert alert-danger mt-3";
+              statusAdicaoBanco.textContent = data.mensagem || "Falha ao adicionar imagem ao banco.";
+            }
+          } catch (err) {
+            statusAdicaoBanco.className = "alert alert-danger mt-3";
+            statusAdicaoBanco.textContent = "Erro de comunicação com o servidor.";
+          } finally {
+            btnAdicionarBanco.disabled = false;
+          }
+        });
 
         // ---- Webcam ----
         let streaming = false;
