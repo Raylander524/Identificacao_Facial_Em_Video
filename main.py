@@ -250,6 +250,20 @@ def inserir_referencia_no_milvus(collection, referencia, embedding):
     return True
 
 
+def obter_total_imagens_milvus(collection):
+    if collection is None:
+        return 0
+
+    total = getattr(collection, "num_entities", 0)
+    if callable(total):
+        total = total()
+
+    try:
+        return int(total)
+    except (TypeError, ValueError):
+        return 0
+
+
 collection_rostos = carregar_collection_milvus()
 
 
@@ -462,6 +476,18 @@ def index():
 @app.route("/progresso")
 def get_progresso():
     return jsonify(progresso)
+
+@app.route("/contar_imagens")
+def contar_imagens():
+    if collection_rostos is None:
+        return jsonify({"total": 0, "mensagem": "Milvus indisponível"}), 503
+    
+    try:
+        total = obter_total_imagens_milvus(collection_rostos)
+        return jsonify({"total": total, "mensagem": "Sucesso"}), 200
+    except Exception as e:
+        print(f"Erro ao contar imagens no Milvus: {e}")
+        return jsonify({"total": 0, "mensagem": str(e)}), 500
 
 @app.route("/analisar_foto", methods=["POST"])
 def analisar_foto():

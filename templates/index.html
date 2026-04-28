@@ -61,6 +61,17 @@
         <i class="bi bi-person-bounding-box icon-btn"></i>Reconhecimento Facial
       </h1>
 
+      <!-- CONTADOR DE IMAGENS NO MILVUS -->
+      <div class="card mb-4 border-info bg-light">
+        <div class="card-body text-center">
+          <h5 class="card-title text-info mb-0">
+            <i class="bi bi-database"></i> Imagens Indexadas no Banco de Dados
+          </h5>
+          <h2 class="text-primary mt-2 mb-0" id="total-imagens">0</h2>
+          <small class="text-muted">Total de faces armazenadas no Milvus</small>
+        </div>
+      </div>
+
       <!-- SEÇÃO 1: ENVIAR VÍDEO -->
       <div class="card p-3">
         <div class="section-title"><i class="bi bi-upload"></i> Enviar vídeo para análise</div>
@@ -79,7 +90,9 @@
 
       <!-- 🆕 SEÇÃO 2: ENVIAR FOTO PARA ANÁLISE -->
       <div class="card p-3">
-        <div class="section-title"><i class="bi bi-image"></i> Enviar foto para análise</div>
+        <div class="section-title">
+          <i class="bi bi-image"></i> Enviar foto para análise
+        </div>
         <!-- Aqui o form faz POST normal para a rota /analisar_foto e abre nova página -->
         <form id="form-foto" method="post" enctype="multipart/form-data" action="/analisar_foto">
           <div class="mb-3">
@@ -91,7 +104,7 @@
             <input type="number" id="quantidade" name="quantidade" class="form-control" value="3" min="1" max="100" required>
           </div>
 
-          <button type="submit" class="btn btn-success btn-lg w-100">
+          <button type="submit" class="btn btn-primary btn-lg w-100">
             <i class="bi bi-search icon-btn"></i>Enviar Foto para Análise
           </button>
 
@@ -108,7 +121,7 @@
         <div class="section-title"><i class="bi bi-camera-video"></i> Visualização do DVR (CFTV)</div>
         <div class="mb-3 text-center">
           <p class="text-muted mb-3">Monitore e identifique pessoas em tempo real a partir da câmera de segurança.</p>
-          <button type="button" class="btn btn-success btn-lg mb-2" onclick="window.location.href='/dvr'">
+          <button type="button" class="btn btn-primary btn-lg mb-2" onclick="window.location.href='/dvr'">
             <i class="bi bi-display icon-btn"></i>Abrir Visualização DVR
           </button>
         </div>
@@ -118,7 +131,7 @@
       <div class="card p-3">
         <div class="section-title"><i class="bi bi-camera-video"></i> Verificar pessoas pela Webcam</div>
         <div class="mb-3 text-center">
-          <button type="button" class="btn btn-success btn-lg mb-2" onclick="window.location.href='/webcam'">
+          <button type="button" class="btn btn-primary btn-lg mb-2" onclick="window.location.href='/webcam'">
             <i class="bi bi-camera-fill icon-btn"></i>Verificar pela Webcam
           </button>
           <button type="button" class="btn btn-danger btn-lg mb-2" id="btn-parar" style="display:none;" onclick="pararWebcam()">
@@ -133,6 +146,24 @@
 
       <!-- SCRIPTS -->
       <script>
+        // ---- Atualizar contagem de imagens no Milvus ----
+        async function atualizarContagemImagens() {
+          try {
+            const response = await fetch("/contar_imagens");
+            const data = await response.json();
+            if (response.ok) {
+              document.getElementById("total-imagens").textContent = data.total;
+            }
+          } catch (err) {
+            console.error("Erro ao atualizar contagem de imagens:", err);
+          }
+        }
+
+        // Carregar contagem ao inicializar a página
+        document.addEventListener("DOMContentLoaded", function() {
+          atualizarContagemImagens();
+        });
+
         // ---- Envio de vídeo com barra de progresso ----
         const form = document.getElementById("form-video");
         const barra = document.getElementById("barra-progresso");
@@ -185,6 +216,7 @@
             if (response.ok && data.adicionada) {
               statusAdicaoBanco.className = "alert alert-success mt-3";
               statusAdicaoBanco.textContent = data.mensagem;
+              atualizarContagemImagens();
             } else {
               statusAdicaoBanco.className = "alert alert-danger mt-3";
               statusAdicaoBanco.textContent = data.mensagem || "Falha ao adicionar imagem ao banco.";

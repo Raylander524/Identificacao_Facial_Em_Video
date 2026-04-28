@@ -2,7 +2,7 @@ version: "3.9"
 
 services:
   app:
-    build: .
+    #build: .
     image: jeanmag/video_face_recognition_arida:latest
     container_name: video_face_recognition_app
     depends_on:
