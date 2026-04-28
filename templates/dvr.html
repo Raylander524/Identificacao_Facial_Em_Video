@@ -1,0 +1,121 @@
+<!doctype html>
+<html>
+  <head>
+    <title>Visualização da Câmera do DVR</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css">
+    <style>
+      body { background: #f8f9fa; }
+      .container { max-width: 900px; margin-top: 40px; }
+      .video-box { border-radius: 8px; border: 2px solid #dee2e6; }
+      .card-pessoa { min-width: 300px; max-width: 100%; margin: 24px auto; }
+      .card-header { font-size: 1.2rem; }
+      .img-fluid { max-height: 180px; }
+      .cards-row { display: block; }
+      .card-col {
+        padding-left: 24px;
+        padding-right: 24px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container bg-white shadow rounded p-4">
+      <div class="d-flex justify-content-between align-items-center mb-3">
+        <h2 class="text-primary">
+          <i class="bi bi-camera-video icon-btn me-2"></i>
+          Câmera do CFTV
+        </h2>
+        <a href="{{ url_for('index') }}" class="btn btn-outline-primary">
+          <i class="bi bi-arrow-left"></i> Voltar
+        </a>
+      </div>
+      <div class="row mb-4">
+        <div class="col-12 text-center">
+          <img id="dvr-stream" src="{{ url_for('dvr_stream') }}" class="img-fluid video-box" style="max-height:480px;" alt="Stream DVR" />
+        </div>
+      </div>
+      <div id="resultado" class="mb-3 text-center"></div>
+      <div id="foto-reconhecida"></div>
+      <div class="text-center text-muted mt-2">Se a imagem não aparecer, verifique a conexão RTSP.</div>
+    </div>
+    <script>
+      let ultimaPessoaIdentificada = null;
+
+      function atualizarReconhecimento() {
+        const resultado = document.getElementById('resultado');
+        const fotoReconhecida = document.getElementById('foto-reconhecida');
+        fetch('/processar_frame_dvr')
+          .then(r => r.json())
+          .then(data => {
+            resultado.innerHTML = data.mensagem || '';
+            if (data.encontrado && data.pessoas && data.pessoas.length > 0) {
+              // Atualiza a última pessoa identificada
+              ultimaPessoaIdentificada = data.pessoas;
+              let html = '<div class="row justify-content-center gx-4 gy-4">';
+              data.pessoas.forEach(pessoa => {
+                html += `
+                  <div class="col-12 col-md-6 col-lg-4 d-flex">
+                    <div class="card card-pessoa shadow-lg border-0 flex-fill">
+                      <div class="card-header bg-success text-white text-center">
+                        <i class="bi bi-person-check-fill"></i> ${pessoa.nome}
+                      </div>
+                      <div class="card-body">
+                        <div class="row align-items-center">
+                          <div class="col-6 text-center mb-2 mb-md-0">
+                            <img src="data:image/jpeg;base64,${pessoa.foto}" class="img-fluid rounded border">
+                            <div class="mt-2 text-secondary fw-semibold">Recorte do Vídeo</div>
+                          </div>
+                          <div class="col-6 text-center">
+                            <img src="data:image/jpeg;base64,${pessoa.foto_referencia}" class="img-fluid rounded border">
+                            <div class="mt-2 text-secondary fw-semibold">Imagem Arquivada</div>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                `;
+              });
+              html += '</div>';
+              fotoReconhecida.innerHTML = html;
+            } else if (ultimaPessoaIdentificada) {
+              // Se ninguém foi detectado agora, mas já houve detecção antes, mantém a última
+              let html = '<div class="row justify-content-center gx-4 gy-4">';
+              ultimaPessoaIdentificada.forEach(pessoa => {
+                html += `
+                  <div class="col-12 col-md-6 col-lg-4 d-flex">
+                    <div class="card card-pessoa shadow-lg border-0 flex-fill">
+                      <div class="card-header bg-secondary text-white text-center">
+                        <i class="bi bi-person-circle"></i> ${pessoa.nome} <small>(última detecção)</small>
+                      </div>
+                      <div class="card-body">
+                        <div class="row align-items-center">
+                          <div class="col-6 text-center mb-2 mb-md-0">
+                            <img src="data:image/jpeg;base64,${pessoa.foto}" class="img-fluid rounded border">
+                            <div class="mt-2 text-secondary fw-semibold">Recorte do Vídeo</div>
+                          </div>
+                          <div class="col-6 text-center">
+                            <img src="data:image/jpeg;base64,${pessoa.foto_referencia}" class="img-fluid rounded border">
+                            <div class="mt-2 text-secondary fw-semibold">Imagem Arquivada</div>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                `;
+              });
+              html += '</div>';
+              fotoReconhecida.innerHTML = html;
+            }
+          })
+          .catch(() => {
+            resultado.innerHTML = 'Erro ao consultar reconhecimento.';
+          })
+      }
+
+      // Atualiza reconhecimento a cada 1s
+      setInterval(atualizarReconhecimento, 1000);
+      // Primeira chamada rápida
+      atualizarReconhecimento();
+    </script>
+  </body>
+</html>

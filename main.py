@@ -1,6 +1,6 @@
 import numpy as np
 import requests
-from flask import Flask, request, render_template, url_for, jsonify,send_from_directory
+from flask import Flask, request, render_template, url_for, jsonify,send_from_directory,Response
 import os
 import cv2
 from ultralytics import YOLO
@@ -39,7 +39,11 @@ MILVUS_COSINE_THRESHOLD = 0.5
 ROSTOS_DATASET_DIR = os.getenv("ROSTOS_DATASET_DIR", "")
 IMAGENS_ADICIONADAS_DIR = os.getenv("IMAGENS_ADICIONADAS_DIR", "imagens_adicionadas")
 os.makedirs(IMAGENS_ADICIONADAS_DIR, exist_ok=True)
-
+RTSP_URL = "rtsp://teste:abc123456@200.19.182.251:8080/cam/realmonitor?channel=1&subtype=0"
+frame_lock = threading.Lock()
+cap_rtsp = None
+latest_frame = None
+latest_jpeg = None
 
 # === Carregar modelos ===
 yolo = YOLO("yolo11n.pt")
@@ -267,7 +271,9 @@ def processar_frame(frame):
                 )
 
             if similares:
-                resultados.append((similares[0]["nome"], face_crop))
+                referencia_url = similares[0]["nome"]
+                referencia_arquivo = referencia_para_arquivo(referencia_url)
+                resultados.append((similares[0]["nome"], referencia_arquivo, face_crop))
             
     return resultados
 
@@ -349,6 +355,56 @@ def processar_lote(frames_batch, frame_indices, imagens_detectadas):
                         "recorte": recorte_path,
                     }
 
+def inicializar_rtsp():
+    global cap_rtsp
+    cap_rtsp = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG)
+
+    if not cap_rtsp.isOpened():
+        raise RuntimeError("Não foi possível abrir o RTSP")
+
+def rtsp_reader():
+    global cap_rtsp, latest_frame, latest_jpeg
+    while True:
+        try:
+            if cap_rtsp is None or not cap_rtsp.isOpened():
+                try:
+                    inicializar_rtsp()
+                except Exception as e:
+                    time.sleep(2)
+                    continue
+
+            ret, frame = cap_rtsp.read()
+            if not ret:
+                # tenta reabrir
+                cap_rtsp.release()
+                cap_rtsp = None
+                time.sleep(0.5)
+                continue
+
+            ok, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+            if not ok:
+                continue
+
+            with frame_lock:
+                latest_frame = frame
+                latest_jpeg = buffer.tobytes()
+
+            # controle simples de taxa (~10 fps)
+            # time.sleep(0.1)
+        except Exception:
+            time.sleep(0.5)
+
+def generate_dvr_stream():
+    global latest_jpeg
+    boundary = b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
+    while True:
+        with frame_lock:
+            frame_bytes = latest_jpeg
+        if frame_bytes is None:
+            time.sleep(0.1)
+            continue
+        yield boundary + frame_bytes + b'\r\n'
+
 # Fila para frames recebidos
 frame_queue = queue.Queue()
 result_queue = queue.Queue()
@@ -360,7 +416,7 @@ def worker_identificacao():
             break  # Para a thread
         resultados = processar_frame(frame)
         if resultados:
-            nome_img, face_crop = resultados[0]
+            nome_img, referencia, face_crop = resultados[0]
             mensagem = f"Pessoa reconhecida: {nome_img}"
             encontrado = True
         else:
@@ -370,6 +426,7 @@ def worker_identificacao():
 
 # Inicie a thread ao iniciar o app
 threading.Thread(target=worker_identificacao, daemon=True).start()
+threading.Thread(target=rtsp_reader, daemon=True).start()
 
 @app.route("/", methods=["GET", "POST"])
 def index():
@@ -509,13 +566,12 @@ def processar_frame_webcam():
     frame = cv2.imread(filepath)
     resultados = processar_frame(frame)
     pessoas = []
-    for nome_img, face_crop in resultados:
+    for nome_img, referencia, face_crop in resultados:
         # Foto recortada do vídeo
         _, buffer = cv2.imencode('.jpg', face_crop)
         img_base64 = base64.b64encode(buffer).decode('utf-8')
         # Foto arquivada (referência)
-        ref_img_path = referencia_para_arquivo(nome_img)
-        ref_img = cv2.imread(ref_img_path)
+        ref_img = cv2.imread(referencia)
         if ref_img is None:
             continue
         _, ref_buffer = cv2.imencode('.jpg', ref_img)
@@ -558,6 +614,57 @@ def serve_novas_imagens(filename):
 @app.route('/imagens_adicionadas/<path:filename>')
 def serve_imagens_adicionadas(filename):
     return send_from_directory(IMAGENS_ADICIONADAS_DIR, filename)
+
+@app.route("/processar_frame_dvr", methods=["GET"])
+def processar_frame_dvr():
+    global cap_rtsp
+
+    with frame_lock:
+        frame = None if latest_frame is None else latest_frame.copy()
+    if frame is None:
+        return jsonify({
+            "mensagem": "Aguardando frames do DVR...",
+            "encontrado": False,
+            "pessoas": []
+        })
+
+    resultados = processar_frame(frame)
+
+    pessoas = []
+    for nome_img, referencia, face_crop in resultados:
+        _, buffer = cv2.imencode('.jpg', face_crop)
+        img_base64 = base64.b64encode(buffer).decode("utf-8")
+
+        ref_img = cv2.imread(referencia)
+        _, ref_buffer = cv2.imencode('.jpg', ref_img)
+        ref_base64 = base64.b64encode(ref_buffer).decode("utf-8")
+
+        pessoas.append({
+            "nome": nome_img,
+            "foto": img_base64,
+            "foto_referencia": ref_base64
+        })
+
+    if pessoas:
+        mensagem = f"{len(pessoas)} pessoa(s) reconhecida(s): " + ", ".join(p["nome"] for p in pessoas)
+        encontrado = True
+    else:
+        mensagem = "Nenhuma pessoa reconhecida."
+        encontrado = False
+
+    return jsonify({
+        "mensagem": mensagem,
+        "encontrado": encontrado,
+        "pessoas": pessoas
+    })
+
+@app.route("/dvr")
+def dvr():
+    return render_template("dvr.html")
+
+@app.route("/dvr_stream")
+def dvr_stream():
+    return Response(generate_dvr_stream(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 @app.route("/ocr")
 def ocr():
