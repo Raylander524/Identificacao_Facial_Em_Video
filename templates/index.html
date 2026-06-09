@@ -152,7 +152,7 @@
             const response = await fetch("/contar_imagens");
             const data = await response.json();
             if (response.ok) {
-              document.getElementById("total-imagens").textContent = data.total;
+              document.getElementById("total-imagens").textContent = data.total.toLocaleString('pt-BR');
             }
           } catch (err) {
             console.error("Erro ao atualizar contagem de imagens:", err);

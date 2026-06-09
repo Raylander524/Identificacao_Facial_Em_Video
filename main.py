@@ -3,7 +3,6 @@ import requests
 from flask import Flask, request, render_template, url_for, jsonify,send_from_directory,Response
 import os
 import cv2
-from ultralytics import YOLO
 import insightface
 from werkzeug.utils import secure_filename
 import threading
@@ -14,13 +13,12 @@ import shutil
 import time
 import onnxruntime as ort
 from pymilvus import (
-    Collection,
-    CollectionSchema,
+    MilvusClient,
     DataType,
-    FieldSchema,
-    connections,
-    utility,
 )
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # === Configuração Flask ===
 app = Flask(__name__)
@@ -28,7 +26,7 @@ UPLOAD_FOLDER = "uploads"
 RESULT_FOLDER = "static/resultados"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(RESULT_FOLDER, exist_ok=True)
-PASTA_INDICE = "index"
+#PASTA_INDICE = "index"
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 OCR_API_URL = "http://200.129.44.250:9000/process"   # pode ser "http://localhost:9000" se for rodar local local
 MILVUS_HOST = os.getenv("MILVUS_HOST", "milvus-standalone")
@@ -38,15 +36,32 @@ EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "512"))
 MILVUS_COSINE_THRESHOLD = 0.5
 ROSTOS_DATASET_DIR = os.getenv("ROSTOS_DATASET_DIR", "")
 IMAGENS_ADICIONADAS_DIR = os.getenv("IMAGENS_ADICIONADAS_DIR", "imagens_adicionadas")
+# OCR_API_URL = os.getenv("OCR_API_URL")
+# MILVUS_HOST = os.getenv("MILVUS_HOST")
+# MILVUS_PORT = os.getenv("MILVUS_PORT")
+# MILVUS_COLLECTION = os.getenv("MILVUS_COLLECTION")
+# EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM"))
+# MILVUS_COSINE_THRESHOLD = float(os.getenv("MILVUS_COSINE_THRESHOLD"))
+# ROSTOS_DATASET_DIR = os.getenv("ROSTOS_DATASET_DIR")
+# IMAGENS_ADICIONADAS_DIR = os.getenv("IMAGENS_ADICIONADAS_DIR")
+INDEX_BATCH_SIZE = int(os.getenv("INDEX_BATCH_SIZE", "512"))
+INDEX_LOG_EVERY = int(os.getenv("INDEX_LOG_EVERY", "5000"))
+INDEX_FLUSH_EVERY = int(os.getenv("INDEX_FLUSH_EVERY", "50000"))
+MILVUS_RECREATE_COLLECTION = os.getenv("MILVUS_RECREATE_COLLECTION", "false").lower() in {
+    "1",
+    "true",
+    "yes",
+    "sim",
+}
+
 os.makedirs(IMAGENS_ADICIONADAS_DIR, exist_ok=True)
-RTSP_URL = "rtsp://teste:abc123456@200.19.182.251:8080/cam/realmonitor?channel=1&subtype=0"
+RTSP_URL = os.getenv("CAMERA_URL")
 frame_lock = threading.Lock()
 cap_rtsp = None
 latest_frame = None
 latest_jpeg = None
 
 # === Carregar modelos ===
-yolo = YOLO("yolo11n.pt")
 available_providers = ort.get_available_providers()
 if "CUDAExecutionProvider" in available_providers:
     providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
@@ -55,9 +70,19 @@ else:
     providers = ["CPUExecutionProvider"]
     ctx_id = -1
 model = insightface.app.FaceAnalysis(name="buffalo_l", providers=providers)
-model.prepare(ctx_id=0, det_size=(320, 320))
+model.prepare(ctx_id=ctx_id, det_size=(320, 320))
 
 progresso = {"percent": 0}
+progresso_indexacao = {
+    "status": "idle",
+    "processadas": 0,
+    "inseridas": 0,
+    "invalidas": 0,
+    "sem_rosto": 0,
+    "erros": 0,
+    "inicio": None,
+    "atualizado_em": None,
+}
 
 
 def obter_diretorio_dataset():
@@ -124,38 +149,115 @@ def extrair_embedding_principal(imagem):
     return embedding / norma
 
 
-def popular_collection_dataset(collection, dataset_dir, batch_size=128):
-    referencias_batch = []
-    embeddings_batch = []
+def popular_collection_dataset(milvus_client, dataset_dir, batch_size=None):
+    if batch_size is None:
+        batch_size = max(1, INDEX_BATCH_SIZE)
+    log_every = max(1, INDEX_LOG_EVERY)
+    flush_every = max(batch_size, INDEX_FLUSH_EVERY)
+
+    dados_batch = []
     total_imagens = 0
     total_inseridos = 0
+    total_invalidas = 0
+    total_sem_rosto = 0
+    total_erros = 0
+    ultimo_flush = 0
+    inicio = time.time()
+
+    progresso_indexacao.update(
+        {
+            "status": "processando",
+            "processadas": 0,
+            "inseridas": 0,
+            "invalidas": 0,
+            "sem_rosto": 0,
+            "erros": 0,
+            "inicio": inicio,
+            "atualizado_em": inicio,
+        }
+    )
+
+    def imprimir_progresso(final=False):
+        agora = time.time()
+        duracao = max(agora - inicio, 1e-6)
+        taxa_lidas = total_imagens / duracao
+        taxa_inseridas = total_inseridos / duracao
+        progresso_indexacao.update(
+            {
+                "status": "concluido" if final else "processando",
+                "processadas": total_imagens,
+                "inseridas": total_inseridos,
+                "invalidas": total_invalidas,
+                "sem_rosto": total_sem_rosto,
+                "erros": total_erros,
+                "atualizado_em": agora,
+            }
+        )
+        print(
+            "[INDEXACAO] "
+            f"processadas={total_imagens} | inseridas={total_inseridos} | "
+            f"invalidas={total_invalidas} | sem_rosto={total_sem_rosto} | "
+            f"erros={total_erros} | tempo={duracao:.1f}s | "
+            f"taxa_lidas={taxa_lidas:.2f}/s | taxa_inseridas={taxa_inseridas:.2f}/s"
+        )
+
+    print(
+        f"Iniciando carga inicial do Milvus com batch_size={batch_size}, "
+        f"log_every={log_every}, flush_every={flush_every}."
+    )
 
     for caminho_img in listar_imagens_dataset(dataset_dir):
         total_imagens += 1
         imagem = cv2.imread(caminho_img)
         if imagem is None:
+            total_invalidas += 1
+            if total_imagens % log_every == 0:
+                imprimir_progresso()
             continue
 
-        embedding = extrair_embedding_principal(imagem)
+        try:
+            embedding = extrair_embedding_principal(imagem)
+        except Exception as e:
+            total_erros += 1
+            if total_erros <= 5:
+                print(f"Falha ao extrair embedding em {caminho_img}: {e}")
+            if total_imagens % log_every == 0:
+                imprimir_progresso()
+            continue
+
         if embedding is None:
+            total_sem_rosto += 1
+            if total_imagens % log_every == 0:
+                imprimir_progresso()
             continue
 
-        referencias_batch.append(referencia_para_url(caminho_img))
-        embeddings_batch.append(embedding.tolist())
+        dados_batch.append(
+            {
+                "nome": referencia_para_url(caminho_img),
+                "embedding": embedding.tolist(),
+            }
+        )
 
-        if len(referencias_batch) >= batch_size:
-            collection.insert([referencias_batch, embeddings_batch])
-            total_inseridos += len(referencias_batch)
-            referencias_batch.clear()
-            embeddings_batch.clear()
+        if len(dados_batch) >= batch_size:
+            milvus_client.insert(collection_name=MILVUS_COLLECTION, data=dados_batch)
+            total_inseridos += len(dados_batch)
+            dados_batch.clear()
 
-    if referencias_batch:
-        collection.insert([referencias_batch, embeddings_batch])
-        total_inseridos += len(referencias_batch)
+            if hasattr(milvus_client, "flush") and (total_inseridos - ultimo_flush) >= flush_every:
+                milvus_client.flush(collection_name=MILVUS_COLLECTION)
+                ultimo_flush = total_inseridos
 
-    if total_inseridos > 0:
-        collection.flush()
+        if total_imagens % log_every == 0:
+            imprimir_progresso()
 
+    if dados_batch:
+        milvus_client.insert(collection_name=MILVUS_COLLECTION, data=dados_batch)
+        total_inseridos += len(dados_batch)
+
+    if total_inseridos > 0 and hasattr(milvus_client, "flush"):
+        milvus_client.flush(collection_name=MILVUS_COLLECTION)
+
+    imprimir_progresso(final=True)
     print(
         f"Carga inicial do Milvus concluída: {total_inseridos} embeddings "
         f"a partir de {total_imagens} imagens do dataset."
@@ -165,7 +267,8 @@ def carregar_collection_milvus():
     ultima_excecao = None
     for tentativa in range(15):
         try:
-            connections.connect(alias="default", host=MILVUS_HOST, port=MILVUS_PORT)
+            milvus_client = MilvusClient(uri=f"http://{MILVUS_HOST}:{MILVUS_PORT}")
+            milvus_client.list_collections()
             break
         except Exception as e:
             ultima_excecao = e
@@ -176,17 +279,44 @@ def carregar_collection_milvus():
         return None
 
     colecao_criada = False
-    if not utility.has_collection(MILVUS_COLLECTION):
-        fields = [
-            FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
-            FieldSchema(name="nome", dtype=DataType.VARCHAR, max_length=1024),
-            FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=EMBEDDING_DIM),
-        ]
-        schema = CollectionSchema(fields=fields, description="Embeddings faciais")
-        collection = Collection(name=MILVUS_COLLECTION, schema=schema)
+    if milvus_client.has_collection(collection_name=MILVUS_COLLECTION):
+        if MILVUS_RECREATE_COLLECTION:
+            milvus_client.drop_collection(collection_name=MILVUS_COLLECTION)
+        else:
+            colecao_criada = False
+            if hasattr(milvus_client, "load_collection"):
+                try:
+                    milvus_client.load_collection(collection_name=MILVUS_COLLECTION)
+                except Exception as e:
+                    print(f"Não foi possível carregar a coleção no Milvus: {e}")
+            return milvus_client
+
+    if not milvus_client.has_collection(collection_name=MILVUS_COLLECTION):
+        schema = milvus_client.create_schema(auto_id=False, enable_dynamic_field=False)
+        schema.add_field(
+            field_name="nome",
+            datatype=DataType.VARCHAR,
+            max_length=1024,
+            is_primary=True,
+        )
+        schema.add_field(
+            field_name="embedding", datatype=DataType.FLOAT_VECTOR, dim=EMBEDDING_DIM
+        )
+
+        index_params = milvus_client.prepare_index_params()
+        index_params.add_index(
+            field_name="embedding",
+            index_type="IVF_SQ8",
+            metric_type="COSINE",
+            params={"nlist":  4096},
+        )
+
+        milvus_client.create_collection(
+            collection_name=MILVUS_COLLECTION,
+            schema=schema,
+            index_params=index_params,
+        )
         colecao_criada = True
-    else:
-        collection = Collection(name=MILVUS_COLLECTION)
 
     if colecao_criada:
         dataset_dir = obter_diretorio_dataset()
@@ -196,67 +326,64 @@ def carregar_collection_milvus():
             )
         else:
             print(f"Coleção Milvus não existia. Carregando dataset de: {dataset_dir}")
-            popular_collection_dataset(collection, dataset_dir)
+            popular_collection_dataset(milvus_client, dataset_dir)
 
-    if len(collection.indexes) == 0:
+    if hasattr(milvus_client, "load_collection"):
         try:
-            collection.create_index(
-                field_name="embedding",
-                index_params={
-                    "index_type": "IVF_FLAT",
-                    "metric_type": "COSINE",
-                    "params": {"nlist": 128},
-                },
-            )
+            milvus_client.load_collection(collection_name=MILVUS_COLLECTION)
         except Exception as e:
-            print(f"Não foi possível criar índice IVF_FLAT/COSINE: {e}")
+            print(f"Não foi possível carregar a coleção no Milvus: {e}")
 
-    collection.load()
-    return collection
+    return milvus_client
 
 
-def buscar_similares(collection, embedding, k=1):
-    if collection is None:
+def buscar_similares(milvus_client, embedding, k=1):
+    if milvus_client is None:
         return []
 
     embedding_norm = embedding / np.linalg.norm(embedding)
-    resultados = collection.search(
+    resultados = milvus_client.search(
+        collection_name=MILVUS_COLLECTION,
         data=[embedding_norm.tolist()],
         anns_field="embedding",
-        param={"metric_type": "COSINE", "params": {"nprobe": 16}},
+        search_params={"metric_type": "COSINE", "params": {"nprobe": 32}},
         limit=k,
         output_fields=["nome"],
     )
 
     similares = []
     for hit in resultados[0]:
-        similaridade = float(hit.distance)
+        similaridade = float(hit.get("distance", 0.0))
         if similaridade > MILVUS_COSINE_THRESHOLD:
+            entidade = hit.get("entity", {})
             similares.append({
-                "nome": hit.entity.get("nome"),
+                "nome": entidade.get("nome"),
                 "similaridade": similaridade,
             })
 
     return similares
 
 
-def inserir_referencia_no_milvus(collection, referencia, embedding):
-    if collection is None:
+def inserir_referencia_no_milvus(milvus_client, referencia, embedding):
+    if milvus_client is None:
         return False
 
     embedding_norm = embedding / np.linalg.norm(embedding)
-    collection.insert([[referencia], [embedding_norm.tolist()]])
-    collection.flush()
+    milvus_client.insert(
+        collection_name=MILVUS_COLLECTION,
+        data=[{"nome": referencia, "embedding": embedding_norm.tolist()}],
+    )
+    if hasattr(milvus_client, "flush"):
+        milvus_client.flush(collection_name=MILVUS_COLLECTION)
     return True
 
 
-def obter_total_imagens_milvus(collection):
-    if collection is None:
+def obter_total_imagens_milvus(milvus_client):
+    if milvus_client is None:
         return 0
 
-    total = getattr(collection, "num_entities", 0)
-    if callable(total):
-        total = total()
+    stats = milvus_client.get_collection_stats(collection_name=MILVUS_COLLECTION)
+    total = stats.get("row_count", 0)
 
     try:
         return int(total)
@@ -266,30 +393,65 @@ def obter_total_imagens_milvus(collection):
 
 collection_rostos = carregar_collection_milvus()
 
-
 def processar_frame(frame):
     resultados = []
-    yolo_result = yolo.predict(frame, conf=0.5, classes=[0])
-    for box in yolo_result[0].boxes:
-        x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+    faces = model.get(frame)
+
+    for face in faces:
+        x1, y1, x2, y2 = map(int, face.bbox)
+
         face_crop = frame[y1:y2, x1:x2]
-        faces = model.get(face_crop)
-        if len(faces) > 0:
-            embedding = faces[0].embedding.astype("float32")
-            similares = buscar_similares(collection_rostos, embedding, k=1)
 
-            for i, similar in enumerate(similares):
-                print(
-                    f"Match {i+1}: similaridade = {similar['similaridade']:.4f}, "
-                    f"nome = {similar['nome']}"
+        embedding = face.embedding.astype("float32")
+
+        similares = buscar_similares(
+            collection_rostos,
+            embedding,
+            k=1
+        )
+
+        if similares:
+            referencia_url = similares[0]["nome"]
+
+            referencia_arquivo = referencia_para_arquivo(
+                referencia_url
+            )
+
+            resultados.append(
+                (
+                    similares[0]["nome"],
+                    referencia_arquivo,
+                    face_crop
                 )
+            )
 
-            if similares:
-                referencia_url = similares[0]["nome"]
-                referencia_arquivo = referencia_para_arquivo(referencia_url)
-                resultados.append((similares[0]["nome"], referencia_arquivo, face_crop))
-            
     return resultados
+
+
+# def processar_frame(frame):
+#     resultados = []
+#     yolo_result = yolo.predict(frame, conf=0.5, classes=[0])
+#     for box in yolo_result[0].boxes:
+#         x1, y1, x2, y2 = map(int, box.xyxy[0])
+#         face_crop = frame[y1:y2, x1:x2]
+#         faces = model.get(face_crop)
+#         if len(faces) > 0:
+#             embedding = faces[0].embedding.astype("float32")
+#             similares = buscar_similares(collection_rostos, embedding, k=1)
+
+#             for i, similar in enumerate(similares):
+#                 print(
+#                     f"Match {i+1}: similaridade = {similar['similaridade']:.4f}, "
+#                     f"nome = {similar['nome']}"
+#                 )
+
+#             if similares:
+#                 referencia_url = similares[0]["nome"]
+#                 referencia_arquivo = referencia_para_arquivo(referencia_url)
+#                 resultados.append((similares[0]["nome"], referencia_arquivo, face_crop))
+            
+#     return resultados
 
 def processar_video(video_path, batch_size=32):
     cap = cv2.VideoCapture(video_path)
@@ -333,41 +495,114 @@ def processar_video(video_path, batch_size=32):
     progresso["percent"] = 100
     return imagens_detectadas
 
-
 def processar_lote(frames_batch, frame_indices, imagens_detectadas):
-    yolo_results = yolo.predict(frames_batch, conf=0.5, classes=[0])
 
-    for idx, yolo_result in enumerate(yolo_results):
-        frame = frames_batch[idx]
-        print(f"Frame {frame_indices[idx]} -> {len(yolo_result.boxes)} detecções")
+    for idx, frame in enumerate(frames_batch):
 
-        for box in yolo_result.boxes:
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            face_crop = frame[y1:y2, x1:x2]
-            faces = model.get(face_crop)
+        faces = model.get(frame)
 
-            if len(faces) == 0:
+        print(
+            f"Frame {frame_indices[idx]} -> "
+            f"{len(faces)} rostos"
+        )
+
+        for face in faces:
+
+            x1, y1, x2, y2 = map(int, face.bbox)
+
+            h, w = frame.shape[:2]
+
+            x1 = max(0, x1)
+            y1 = max(0, y1)
+
+            x2 = min(w, x2)
+            y2 = min(h, y2)
+
+            if x2 <= x1 or y2 <= y1:
                 continue
 
-            embedding = faces[0].embedding.astype("float32")
-            similares = buscar_similares(collection_rostos, embedding, k=1)
+            face_crop = frame[y1:y2, x1:x2]
+
+            if face_crop.size == 0:
+                continue
+
+            embedding = face.embedding.astype(np.float32)
+
+            similares = buscar_similares(
+                collection_rostos,
+                embedding,
+                k=1
+            )
 
             for i, similar in enumerate(similares):
+
                 print(
-                    f"Match {i+1}: similaridade = {similar['similaridade']:.4f}, "
-                    f"nome = {similar['nome']}"
+                    f"Match {i+1}: "
+                    f"similaridade={similar['similaridade']:.4f}, "
+                    f"nome={similar['nome']}"
                 )
 
-                if similar["similaridade"] > MILVUS_COSINE_THRESHOLD:
+                if (
+                    similar["similaridade"]
+                    > MILVUS_COSINE_THRESHOLD
+                ):
+
                     nome_img = uuid.uuid4().hex
-                    recorte_nome = f"{nome_img}frame{frame_indices[idx]}.jpg"
-                    recorte_path = os.path.join(RESULT_FOLDER, recorte_nome)
-                    cv2.imwrite(recorte_path, face_crop)
+
+                    recorte_nome = (
+                        f"{nome_img}"
+                        f"frame{frame_indices[idx]}.jpg"
+                    )
+
+                    recorte_path = os.path.join(
+                        RESULT_FOLDER,
+                        recorte_nome
+                    )
+
+                    cv2.imwrite(
+                        recorte_path,
+                        face_crop
+                    )
 
                     imagens_detectadas[nome_img] = {
                         "referencia": similar["nome"],
                         "recorte": recorte_path,
                     }
+
+# def processar_lote(frames_batch, frame_indices, imagens_detectadas):
+#     yolo_results = yolo.predict(frames_batch, conf=0.5, classes=[0])
+
+#     for idx, yolo_result in enumerate(yolo_results):
+#         frame = frames_batch[idx]
+#         print(f"Frame {frame_indices[idx]} -> {len(yolo_result.boxes)} detecções")
+
+#         for box in yolo_result.boxes:
+#             x1, y1, x2, y2 = map(int, box.xyxy[0])
+#             face_crop = frame[y1:y2, x1:x2]
+#             faces = model.get(face_crop)
+
+#             if len(faces) == 0:
+#                 continue
+
+#             embedding = faces[0].embedding.astype("float32")
+#             similares = buscar_similares(collection_rostos, embedding, k=1)
+
+#             for i, similar in enumerate(similares):
+#                 print(
+#                     f"Match {i+1}: similaridade = {similar['similaridade']:.4f}, "
+#                     f"nome = {similar['nome']}"
+#                 )
+
+#                 if similar["similaridade"] > MILVUS_COSINE_THRESHOLD:
+#                     nome_img = uuid.uuid4().hex
+#                     recorte_nome = f"{nome_img}frame{frame_indices[idx]}.jpg"
+#                     recorte_path = os.path.join(RESULT_FOLDER, recorte_nome)
+#                     cv2.imwrite(recorte_path, face_crop)
+
+#                     imagens_detectadas[nome_img] = {
+#                         "referencia": similar["nome"],
+#                         "recorte": recorte_path,
+#                     }
 
 def inicializar_rtsp():
     global cap_rtsp
@@ -476,6 +711,10 @@ def index():
 @app.route("/progresso")
 def get_progresso():
     return jsonify(progresso)
+
+@app.route("/progresso_indexacao")
+def get_progresso_indexacao():
+    return jsonify(progresso_indexacao)
 
 @app.route("/contar_imagens")
 def contar_imagens():

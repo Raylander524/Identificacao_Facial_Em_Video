@@ -3,5 +3,15 @@
 /static/
 /uploads/
 /index/
+/.venv/
 __pycache__/
 
+docker-compose-copy.yml
+docker-compose.milvus.yml
+
+.env
+
+auditoria_model.py
+popula_milvus.py
+
+imagens_sem_rosto.csv

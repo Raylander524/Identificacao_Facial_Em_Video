@@ -2,24 +2,30 @@ version: "3.9"
 
 services:
   app:
-    #build: .
-    image: jeanmag/video_face_recognition_arida:latest
+    build: .
+    image: jeanmag/video_face_recognition_arida:v2.0-milvus
     container_name: video_face_recognition_app
+    runtime: nvidia
+    restart: unless-stopped
     depends_on:
       - milvus-etcd
       - milvus-minio
       - milvus-standalone
     environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - MILVUS_HOST=milvus-standalone
       - MILVUS_PORT=19530
       - MILVUS_COLLECTION=rostos_embeddings
+      # Altere a URL da câmera RTSP conforme necessário 
+      - CAMERA_URL=rtsp://usuario:senha@192.168.0.10:554/stream
     ports:
       - "5000:5000"
     volumes:
-      - /mnt/Projeto_id_facial/PastaTeste:/rostos_dataset
-      #- /home/faroldigital/reconhecimento_facial/novas_imagens:/novas_imagens
-      #- /home/faroldigital/reconhecimento_facial/index:/index
-      - /mnt/Projeto_id_facial/ImagensAdicionadas:/app/imagens_adicionadas
+      # Altere o caminho do dataset conforme necessário
+      - /mnt/exemplo/exemplo/:/rostos_dataset
+      # Altere o caminho das imagens adicionadas conforme necessário
+      - /mnt/exemplo/ImagensAdicionadas:/app/imagens_adicionadas
 
   milvus-etcd:
     image: quay.io/coreos/etcd:v3.5.5
@@ -31,7 +37,8 @@ services:
       - ETCD_SNAPSHOT_COUNT=50000
     command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls=http://0.0.0.0:2379 --data-dir=/etcd
     volumes:
-      - /mnt/Projeto_id_facial/milvus/etcd:/etcd
+      # Altere o caminho dos dados do etcd conforme necessário
+      - /mnt/exemplo/milvus/etcd:/etcd
 
   milvus-minio:
     image: minio/minio:RELEASE.2023-03-20T20-16-18Z
@@ -41,7 +48,8 @@ services:
       - MINIO_SECRET_KEY=minioadmin
     command: minio server /minio_data
     volumes:
-      - /mnt/Projeto_id_facial/milvus/data:/minio_data
+      # Altere o caminho dos dados do MinIO conforme necessário
+      - /mnt/exemplo/milvus/data:/minio_data
 
   milvus-standalone:
     image: milvusdb/milvus:v2.4.4
@@ -54,7 +62,8 @@ services:
       - "19530:19530"
       - "9091:9091"
     volumes:
-      - /mnt/Projeto_id_facial/milvus/data:/var/lib/milvus
+      # Altere o caminho dos dados do Milvus conforme necessário
+      - /mnt/exemplo/milvus/data:/var/lib/milvus
     depends_on:
       - milvus-etcd
       - milvus-minio
